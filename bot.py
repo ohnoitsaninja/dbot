@@ -4,6 +4,7 @@ from discord.ext import commands
 import os
 import asyncio
 import aiohttp
+from aiohttp import web
 import json
 from dotenv import load_dotenv
 
@@ -109,10 +110,36 @@ async def on_ready():
 
 # Slash command (unchanged)
 @bot.tree.command(name="research", description="Start a research thread about a message")
-@app_commands.describe(message="The message to research")
-async def research_slash(interaction: discord.Interaction, message: discord.Message):
+@app_commands.describe(message="The message to research (message URL or content)")
+async def research_slash(interaction: discord.Interaction, message: str):
     await interaction.response.defer()
-    await do_research(message)
+    # If a link was provided, try to fetch the message
+    try:
+        await interaction.response.defer()
+        if message.startswith("https://"):
+            # fetch message by URL
+            # URL format: https://discord.com/channels/<guild_id>/<channel_id>/<message_id>
+            parts = message.split("/")
+            message_id = int(parts[-1])
+            channel_id = int(parts[-2])
+            channel = interaction.guild.get_channel(channel_id)
+            if channel:
+                msg = await channel.fetch_message(message_id)
+                await do_research(msg)
+                return
+    except Exception:
+        # fallback to using content directly
+        pass
+
+    # fallback: create a fake message-like object
+    class _FakeMsg:
+        def __init__(self, content, author, guild, jump_url=""):
+            self.content = content
+            self.author = author
+            self.jump_url = jump_url
+
+    fake_message = _FakeMsg(content=message, author=interaction.user, guild=interaction.guild, jump_url="")
+    await do_research(fake_message)
 
 # Reaction trigger (unchanged)
 @bot.event
@@ -158,4 +185,54 @@ async def do_research(message: discord.Message):
     except Exception as e:
         await thread.send(f"❌ Error: {e}")
 
-bot.run(os.getenv("DISCORD_TOKEN"))
+async def start_webserver(port: int = 8080):
+    """Start a simple aiohttp web server for health checks and status."""
+    app = web.Application()
+
+    async def health(request):
+        return web.Response(text="OK")
+
+    async def status(request):
+        # return bot presence and online state
+        return web.json_response({
+            "bot": str(bot.user) if bot.user else None,
+            "ready": bot.is_ready()
+        })
+
+    app.router.add_get("/", health)
+    app.router.add_get("/health", health)
+    app.router.add_get("/status", status)
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, '0.0.0.0', port)
+    await site.start()
+    print(f"Webserver started on 0.0.0.0:{port}")
+    return runner
+
+
+async def main():
+    """Orchestrator: start webserver and discord bot concurrently."""
+    port = int(os.getenv("PORT", "8080"))
+
+    # start webserver
+    web_runner = await start_webserver(port)
+
+    # start bot in background
+    token = os.getenv("DISCORD_TOKEN")
+    if not token:
+        print("DISCORD_TOKEN is not set — starting only the webserver. The bot will not run.")
+        # keep running so Render health checks pass
+        await asyncio.Event().wait()
+
+    bot_task = asyncio.create_task(bot.start(token))
+
+    try:
+        await bot_task
+    finally:
+        await bot.close()
+        await web_runner.cleanup()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
