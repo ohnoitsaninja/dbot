@@ -1,0 +1,3 @@
+bot.py
+python-dotenv
+aiohttp
