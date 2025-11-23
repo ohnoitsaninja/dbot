@@ -59,7 +59,7 @@ Rules:
     ]
 
     payload = {
-        "model": "grok-beta",  # Or "grok-2-latest" if available
+        "model": "grok-4-1-fast-reasoning",
         "messages": messages,
         "tools": tools,
         "tool_choice": "auto",  # Let Grok decide when to use search
