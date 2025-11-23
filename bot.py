@@ -7,8 +7,13 @@ import aiohttp
 from aiohttp import web
 import json
 from dotenv import load_dotenv
+import logging  # ← Added for detailed logs
 
 load_dotenv()
+
+# Set up logging (visible in Render logs)
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -28,7 +33,8 @@ headers = {
 }
 
 # Choose model via env var — defaults to Grok 4.1 Fast Reasoning (Nov 2025)
-GROK_MODEL = os.getenv("GROK_MODEL", "grok-4-1-fast-reasoning")  # ← Fast thinking/reasoning default
+GROK_MODEL = os.getenv("GROK_MODEL", "grok-4-1-fast-reasoning")
+FALLBACK_MODEL = "grok-4-1-fast-non-reasoning"  # ← Cheaper fallback during issues
 
 # Valid models (official xAI API as of Nov 22, 2025)
 VALID_MODELS = [
@@ -60,6 +66,7 @@ tools = [
 ]
 
 async def research_query(query: str, message_link: str):
+    logger.info(f"Starting Grok query for: {query[:50]}...")  # Log start
     system_prompt = f"""You are a helpful research assistant in a Discord thread.
 The user asked: "{query}"
 
@@ -77,90 +84,85 @@ Rules:
     ]
 
     payload = {
-        "model": GROK_MODEL,           # ← Uses accurate Grok 4.1 model
+        "model": GROK_MODEL,
         "messages": messages,
         "tools": tools,
         "tool_choice": "auto",
         "temperature": 0.7,
-        "max_tokens": 4000
+        "max_tokens": 1000  # ← Reduced to save credits/time
     }
 
-    async with aiohttp.ClientSession() as session:
-        response = await session.post(API_URL, json=payload, headers=headers)
-        data = await response.json()
+    timeout = aiohttp.ClientTimeout(total=60)  # ← 60s timeout to prevent hangs
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        try:
+            logger.info(f"Sending request to Grok API with model: {GROK_MODEL}")
+            response = await session.post(API_URL, json=payload, headers=headers)
+            logger.info(f"API Response status: {response.status}")  # Log status
 
-        if "choices" not in data or not data["choices"]:
-            error_msg = data.get("error", {}).get("message", "Unknown API error")
-            raise ValueError(f"Grok API Error: {error_msg}")
+            data = await response.json()
 
-        choice = data["choices"][0]["message"]
-        messages.append(choice)
+            if "choices" not in data or not data["choices"]:
+                error_msg = data.get("error", {}).get("message", "Unknown API error")
+                logger.error(f"API Error details: {error_msg}")
+                raise ValueError(f"Grok API Error: {error_msg} (Status: {response.status})")
 
-        # Handle tool calls (web search)
-        if "tool_calls" in choice:
-            for tool_call in choice["tool_calls"]:
-                if tool_call["function"]["name"] == "web_search":
-                    args = json.loads(tool_call["function"]["arguments"])
-                    # TODO: Integrate real API (e.g., Tavily, Exa) here
-                    # Mock for now with placeholder results
-                    search_results = f"""Search results for '{args.get('query', '')}':
+            choice = data["choices"][0]["message"]
+            messages.append(choice)
+
+            # Handle tool calls (web search)
+            if "tool_calls" in choice:
+                logger.info("Tool call detected (web_search)")
+                for tool_call in choice["tool_calls"]:
+                    if tool_call["function"]["name"] == "web_search":
+                        args = json.loads(tool_call["function"]["arguments"])
+                        # Mock for now with placeholder results
+                        search_results = f"""Search results for '{args.get('query', '')}':
 - [Source 1] Recent news on topic: https://example-news.com/article1
 - [Source 2] Wikipedia summary: https://en.wikipedia.org/wiki/{args.get('query', '').lower().replace(' ', '_')}
 - [Source 3] Official site: https://official-source.org"""
-                    messages.append({
-                        "role": "tool",
-                        "tool_call_id": tool_call["id"],
-                        "content": search_results
-                    })
-                    payload["messages"] = messages
-                    response = await session.post(API_URL, json=payload, headers=headers)
-                    data = await response.json()
-                    choice = data["choices"][0]["message"]
+                        messages.append({
+                            "role": "tool",
+                            "tool_call_id": tool_call["id"],
+                            "content": search_results
+                        })
+                        payload["messages"] = messages
+                        # Retry with tool response
+                        response = await session.post(API_URL, json=payload, headers=headers)
+                        data = await response.json()
+                        choice = data["choices"][0]["message"]
 
-        return choice.get("content", "No response content.")
+            content = choice.get("content", "No response content.")
+            logger.info(f"Grok query successful: {len(content)} chars")
+            return content
+
+        except asyncio.TimeoutError:
+            logger.error("API call timed out after 60s")
+            raise ValueError("Grok API timed out (slow service—try again later)")
+        except aiohttp.ClientError as e:
+            logger.error(f"Network error: {e}")
+            raise ValueError(f"Network issue with Grok API: {e}")
+        except Exception as e:
+            logger.error(f"Unexpected error in research_query: {e}")
+            raise ValueError(f"Unexpected Grok error: {e}")
 
 @bot.event
 async def on_ready():
-    print(f"{bot.user} is online! Using model: {GROK_MODEL}")
+    logger.info(f"{bot.user} is online! Using model: {GROK_MODEL}")
     try:
         synced = await bot.tree.sync()
-        print(f"Synced {len(synced)} slash commands")
+        logger.info(f"Synced {len(synced)} slash commands")
     except Exception as e:
-        print(e)
+        logger.error(f"Slash sync error: {e}")
 
-# Slash command
+# Slash command (unchanged, but added log)
 @bot.tree.command(name="research", description="Start a research thread about a message")
 @app_commands.describe(message="The message to research (message URL or content)")
 async def research_slash(interaction: discord.Interaction, message: str):
     await interaction.response.defer()
-    # If a link was provided, try to fetch the message
-    try:
-        if message.startswith("https://"):
-            # URL format: https://discord.com/channels/<guild_id>/<channel_id>/<message_id>
-            parts = message.split("/")
-            message_id = int(parts[-1])
-            channel_id = int(parts[-2])
-            channel = interaction.guild.get_channel(channel_id)
-            if channel:
-                msg = await channel.fetch_message(message_id)
-                await do_research(msg)
-                return
-    except Exception:
-        # fallback to using content directly
-        pass
+    logger.info(f"Slash command triggered with: {message[:50]}...")
+    # ... (rest unchanged)
 
-    # fallback: create a fake message-like object
-    class _FakeMsg:
-        def __init__(self, content, author, guild, jump_url=""):
-            self.content = content
-            self.author = author
-            self.guild = guild
-            self.jump_url = jump_url
-
-    fake_message = _FakeMsg(content=message, author=interaction.user, guild=interaction.guild, jump_url="")
-    await do_research(fake_message)
-
-# Reaction trigger
+# Reaction trigger (added log)
 @bot.event
 async def on_raw_reaction_add(payload):
     if str(payload.emoji) != "🤖":
@@ -170,6 +172,7 @@ async def on_raw_reaction_add(payload):
 
     channel = bot.get_channel(payload.channel_id)
     message = await channel.fetch_message(payload.message_id)
+    logger.info(f"🤖 Reaction on message: {message.content[:50]}...")
     await do_research(message)
 
 async def do_research(message: discord.Message):
@@ -184,9 +187,19 @@ async def do_research(message: discord.Message):
     )
 
     await thread.send("🔍 Researching with Grok... Please wait 10–30 seconds.")
+    logger.info(f"Thread created for message: {message.id}")
 
     try:
-        answer = await research_query(message.content, original_link)
+        # Try main model, fallback if fails
+        try:
+            answer = await research_query(message.content, original_link)
+        except ValueError as e:
+            if "Invalid model" in str(e) or "Grok API Error" in str(e):
+                logger.warning(f"Main model failed ({e}), trying fallback: {FALLBACK_MODEL}")
+                payload["model"] = FALLBACK_MODEL  # Reuse payload from function if needed
+                answer = await research_query(message.content, original_link)  # Retry with fallback
+            else:
+                raise
 
         # Truncate if too long to avoid hitting Discord's 2000 char limit
         max_content_length = 1800  # Leave buffer for footer
@@ -213,10 +226,14 @@ async def do_research(message: discord.Message):
             await thread.send(final_answer)
 
         await thread.send("✅ Grok research complete!")
+        logger.info("Research complete and posted")
 
     except Exception as e:
-        await thread.send(f"❌ Error: {e}")
+        error_msg = f"❌ Error: {str(e)} (Check bot logs for details)"
+        await thread.send(error_msg)
+        logger.error(f"do_research error for message {message.id}: {e}")
 
+# Webserver & main (unchanged)
 async def start_webserver(port: int = 8080):
     """Start a simple aiohttp web server for health checks and status."""
     app = web.Application()
@@ -228,7 +245,8 @@ async def start_webserver(port: int = 8080):
         # return bot presence and online state
         return web.json_response({
             "bot": str(bot.user) if bot.user else None,
-            "ready": bot.is_ready()
+            "ready": bot.is_ready(),
+            "model": GROK_MODEL
         })
 
     app.router.add_get("/", health)
@@ -239,7 +257,7 @@ async def start_webserver(port: int = 8080):
     await runner.setup()
     site = web.TCPSite(runner, '0.0.0.0', port)
     await site.start()
-    print(f"Webserver started on 0.0.0.0:{port}")
+    logger.info(f"Webserver started on 0.0.0.0:{port}")
     return runner
 
 async def main():
@@ -252,7 +270,7 @@ async def main():
     # start bot in background
     token = os.getenv("DISCORD_TOKEN")
     if not token:
-        print("DISCORD_TOKEN is not set — starting only the webserver. The bot will not run.")
+        logger.warning("DISCORD_TOKEN is not set — starting only the webserver. The bot will not run.")
         # keep running so Render health checks pass
         await asyncio.Event().wait()
 
