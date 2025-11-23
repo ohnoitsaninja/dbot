@@ -5,6 +5,9 @@ services:
     plan: free
     buildCommand: pip install -r requirements.txt
     startCommand: python bot.py
+    healthCheckPath: /health
     envVars:
       - key: DISCORD_TOKEN
+        value: null
       - key: GROK_API_KEY
+        value: null

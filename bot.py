@@ -67,6 +67,7 @@ Rules:
 - Use the web_search tool if you need real-time info (e.g., facts, news, prices, events).
 - Always cite sources with links.
 - Use markdown, bullet points, and code blocks when helpful.
+- Keep your response under 1000 characters.
 - At the end, say "Replying to: {message_link}"
 - Be concise but thorough."""
 
@@ -187,16 +188,29 @@ async def do_research(message: discord.Message):
     try:
         answer = await research_query(message.content, original_link)
 
-        # Split long answers
-        if len(answer) > 2000:
-            parts = [answer[i:i+1990] for i in range(0, len(answer), 1990)]
-            for i, part in enumerate(parts):
-                if i == len(parts)-1:
-                    await thread.send(part + f"\n\n[Continued]\nReplying to → {original_link}")
+        # Truncate if too long to avoid hitting Discord's 2000 char limit
+        max_content_length = 1800  # Leave buffer for footer
+        if len(answer) > max_content_length:
+            answer = answer[:max_content_length] + "\n... (truncated)"
+
+        # Build message with footer
+        footer = f"\n\nReplying to → {original_link}"
+        final_answer = answer + footer
+
+        # Split into Discord-safe chunks (2000 char limit)
+        if len(final_answer) > 2000:
+            # Split the answer part (without footer) and re-add footer to each part
+            chunk_size = 1900
+            answer_parts = [answer[i:i+chunk_size] for i in range(0, len(answer), chunk_size)]
+            for i, part in enumerate(answer_parts):
+                if i == len(answer_parts) - 1:
+                    # Last chunk: add footer
+                    await thread.send(part + footer)
                 else:
+                    # Not last chunk: add continuation indicator
                     await thread.send(part + "\n\n...(continued)")
         else:
-            await thread.send(answer + f"\n\nReplying to → {original_link}")
+            await thread.send(final_answer)
 
         await thread.send("✅ Grok research complete!")
 
