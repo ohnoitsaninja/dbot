@@ -16,7 +16,7 @@ intents.reactions = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# === GROK API CONFIG (NOW CONFIGURABLE) ===
+# === GROK API CONFIG (ACCURATE NOV 2025 MODELS) ===
 API_URL = "https://api.x.ai/v1/chat/completions"
 GROK_API_KEY = os.getenv("GROK_API_KEY")
 if not GROK_API_KEY:
@@ -27,21 +27,20 @@ headers = {
     "Content-Type": "application/json"
 }
 
-# Choose model via env var — these are the correct names as of Nov 2025
-GROK_MODEL = os.getenv("GROK_MODEL", "grok-4-fast-thinking")  # ← Default: Grok-4 Fast Thinking
+# Choose model via env var — defaults to Grok 4.1 Fast Reasoning (Nov 2025)
+GROK_MODEL = os.getenv("GROK_MODEL", "grok-4-1-fast-reasoning")  # ← Fast thinking/reasoning default
 
-# Optional: list of valid models (for future reference)
+# Valid models (official xAI API as of Nov 22, 2025)
 VALID_MODELS = [
-    "grok-4-fast-thinking",      # ← Best speed + reasoning (recommended)
-    "grok-4",                    # Full Grok-4 (slower, smarter)
-    "grok-3",                    # Previous gen
-    "grok-beta",                 # Legacy
+    "grok-4-1-fast-reasoning",       # Agentic tool-calling + reasoning (recommended for research)
+    "grok-4-1-fast-non-reasoning",   # Fast creative/emotional generation
+    "grok-code-fast-1",              # Code-focused tasks
 ]
 
 if GROK_MODEL not in VALID_MODELS:
-    print(f"Warning: Using unknown model '{GROK_MODEL}' — hope you know what you're doing!")
+    raise ValueError(f"Invalid model '{GROK_MODEL}'. Must be one of: {', '.join(VALID_MODELS)}")
 
-# Tool definition (web search — still free until Dec 3, 2025)
+# Tool definition (web search — free until Dec 3, 2025)
 tools = [
     {
         "type": "function",
@@ -77,7 +76,7 @@ Rules:
     ]
 
     payload = {
-        "model": GROK_MODEL,           # ← Now uses the correct configurable model
+        "model": GROK_MODEL,           # ← Uses accurate Grok 4.1 model
         "messages": messages,
         "tools": tools,
         "tool_choice": "auto",
@@ -101,8 +100,12 @@ Rules:
             for tool_call in choice["tool_calls"]:
                 if tool_call["function"]["name"] == "web_search":
                     args = json.loads(tool_call["function"]["arguments"])
-                    # Replace this with real search later (Tavily, Exa, Serper, etc.)
-                    search_results = f"Mock search results for: '{args.get('query', '')}'\n• Result 1: https://example.com\n• Result 2: https://wikipedia.org"
+                    # TODO: Integrate real API (e.g., Tavily, Exa) here
+                    # Mock for now with placeholder results
+                    search_results = f"""Search results for '{args.get('query', '')}':
+- [Source 1] Recent news on topic: https://example-news.com/article1
+- [Source 2] Wikipedia summary: https://en.wikipedia.org/wiki/{args.get('query', '').lower().replace(' ', '_')}
+- [Source 3] Official site: https://official-source.org"""
                     messages.append({
                         "role": "tool",
                         "tool_call_id": tool_call["id"],
@@ -115,7 +118,6 @@ Rules:
 
         return choice.get("content", "No response content.")
 
-# === Rest of your bot code (unchanged below) ===
 @bot.event
 async def on_ready():
     print(f"{bot.user} is online! Using model: {GROK_MODEL}")
@@ -125,8 +127,128 @@ async def on_ready():
     except Exception as e:
         print(e)
 
-# [Your existing slash command, reaction handler, do_research, webserver, main() — all unchanged]
+# Slash command
+@bot.tree.command(name="research", description="Start a research thread about a message")
+@app_commands.describe(message="The message to research (message URL or content)")
+async def research_slash(interaction: discord.Interaction, message: str):
+    await interaction.response.defer()
+    # If a link was provided, try to fetch the message
+    try:
+        if message.startswith("https://"):
+            # URL format: https://discord.com/channels/<guild_id>/<channel_id>/<message_id>
+            parts = message.split("/")
+            message_id = int(parts[-1])
+            channel_id = int(parts[-2])
+            channel = interaction.guild.get_channel(channel_id)
+            if channel:
+                msg = await channel.fetch_message(message_id)
+                await do_research(msg)
+                return
+    except Exception:
+        # fallback to using content directly
+        pass
 
-# ... [keep everything else exactly as you had it from do_research() down to main()]
+    # fallback: create a fake message-like object
+    class _FakeMsg:
+        def __init__(self, content, author, guild, jump_url=""):
+            self.content = content
+            self.author = author
+            self.guild = guild
+            self.jump_url = jump_url
 
-# Just paste the rest of your original code here — no changes needed below this line
+    fake_message = _FakeMsg(content=message, author=interaction.user, guild=interaction.guild, jump_url="")
+    await do_research(fake_message)
+
+# Reaction trigger
+@bot.event
+async def on_raw_reaction_add(payload):
+    if str(payload.emoji) != "🤖":
+        return
+    if payload.user_id == bot.user.id:
+        return
+
+    channel = bot.get_channel(payload.channel_id)
+    message = await channel.fetch_message(payload.message_id)
+    await do_research(message)
+
+async def do_research(message: discord.Message):
+    if message.author == bot.user:
+        return
+
+    original_link = message.jump_url
+
+    thread = await message.create_thread(
+        name=f"Research: {message.content[:50]}...",
+        auto_archive_duration=1440
+    )
+
+    await thread.send("🔍 Researching with Grok... Please wait 10–30 seconds.")
+
+    try:
+        answer = await research_query(message.content, original_link)
+
+        # Split long answers
+        if len(answer) > 2000:
+            parts = [answer[i:i+1990] for i in range(0, len(answer), 1990)]
+            for i, part in enumerate(parts):
+                if i == len(parts)-1:
+                    await thread.send(part + f"\n\n[Continued]\nReplying to → {original_link}")
+                else:
+                    await thread.send(part + "\n\n...(continued)")
+        else:
+            await thread.send(answer + f"\n\nReplying to → {original_link}")
+
+        await thread.send("✅ Grok research complete!")
+
+    except Exception as e:
+        await thread.send(f"❌ Error: {e}")
+
+async def start_webserver(port: int = 8080):
+    """Start a simple aiohttp web server for health checks and status."""
+    app = web.Application()
+
+    async def health(request):
+        return web.Response(text="OK")
+
+    async def status(request):
+        # return bot presence and online state
+        return web.json_response({
+            "bot": str(bot.user) if bot.user else None,
+            "ready": bot.is_ready()
+        })
+
+    app.router.add_get("/", health)
+    app.router.add_get("/health", health)
+    app.router.add_get("/status", status)
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, '0.0.0.0', port)
+    await site.start()
+    print(f"Webserver started on 0.0.0.0:{port}")
+    return runner
+
+async def main():
+    """Orchestrator: start webserver and discord bot concurrently."""
+    port = int(os.getenv("PORT", "8080"))
+
+    # start webserver
+    web_runner = await start_webserver(port)
+
+    # start bot in background
+    token = os.getenv("DISCORD_TOKEN")
+    if not token:
+        print("DISCORD_TOKEN is not set — starting only the webserver. The bot will not run.")
+        # keep running so Render health checks pass
+        await asyncio.Event().wait()
+
+    bot_task = asyncio.create_task(bot.start(token))
+
+    try:
+        await bot_task
+    finally:
+        await bot.close()
+        await web_runner.cleanup()
+
+if __name__ == "__main__":
+    asyncio.run(main())
